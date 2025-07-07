@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'dart:math';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:mic_stream/mic_stream.dart';
+import 'package:sound_stream/sound_stream.dart';
 import 'dart:typed_data';
 import 'dart:async';
 
@@ -67,8 +67,6 @@ class _TunerScreenState extends State<TunerScreen>
   Tuning? selectedTuning;
   bool isTuning = false;
   double angle = 0.0;
-  late AnimationController _controller;
-  late Animation<double> _animation;
 
   int currentString = 0; // 1-я струна = индекс 0 (слева и внизу)
   List<bool> tuned = List.generate(6, (_) => false);
@@ -78,56 +76,35 @@ class _TunerScreenState extends State<TunerScreen>
   void initState() {
     super.initState();
     requestMicrophonePermission();
-    selectedTuning = tunings.first;
-    // _controller, _animation и .addListener — больше не нужны!
+    recorder.initialize();
+    selectedTuning = tunings.first; // <-- Дефолтный строй, если вдруг не выбран
   }
 
-  Stream<List<int>>? _micStream;
-  StreamSubscription<List<int>>? _micSubscription;
+  void processAudioData(List<int> data) {
+    // преобразуем в Int16 и далее - в double
+    final doubles = Int16List.view(Uint8List.fromList(data).buffer)
+      .map((x) => x / 32768.0)
+      .toList();
 
-  Future<void> startMicStream() async {
-    if (!(await Permission.microphone.isGranted)) {
-      await requestMicrophonePermission();
+    audioBuffer.addAll(doubles);
+
+    while (audioBuffer.length > bufferSize) {
+      final segment = audioBuffer.sublist(0, bufferSize);
+      final freq = detectFrequency(segment, 44100);
+      List<double> targetFreqs = getFrequenciesForTuning(selectedTuning!.name);
+      int closest = findClosestString(freq, targetFreqs);
+      double deviationHz = freq - targetFreqs[closest];
+
+      setState(() {
+        detectedFrequency = freq;
+        currentString = closest;
+        deviation = deviationHz;
+        tuned = List.generate(6, (i) => (i == closest) && deviationHz.abs() < 1.0);
+        angle = (deviationHz / 15.0).clamp(-1, 1) * pi / 6;
+      });
+
+      audioBuffer = audioBuffer.sublist(bufferSize);
     }
-
-    _micStream = await MicStream.microphone(
-      audioSource: AudioSource.DEFAULT,
-      sampleRate: 44100,
-      channelConfig: ChannelConfig.CHANNEL_IN_MONO,
-      audioFormat: AudioFormat.ENCODING_PCM_16BIT,
-    );
-
-    _micSubscription = _micStream?.listen((List<int> data) {
-      // 1. Преобразуем PCM 16-bit в double [-1..1]
-      final doubles = Int16List.fromList(data)
-          .map((x) => x / 32768.0)
-          .toList();
-
-      audioBuffer.addAll(doubles);
-
-      // 2. Если буфер большой — ищем частоту
-      while (audioBuffer.length > bufferSize) {
-        final segment = audioBuffer.sublist(0, bufferSize);
-        final freq = detectFrequency(segment, 44100);
-
-        // Для текущего тюнинга — получаем эталонные частоты
-        List<double> targetFreqs = getFrequenciesForTuning(selectedTuning!.name);
-
-        int closest = findClosestString(freq, targetFreqs);
-        double deviationHz = freq - targetFreqs[closest];
-
-        setState(() {
-          detectedFrequency = freq;
-          currentString = closest;
-          deviation = deviationHz;
-          tuned = List.generate(6, (i) => (i == closest) && deviationHz.abs() < 1.0); // Подсвечиваем только когда идеально
-          // angle — для стрелки, диапазон ±30° (например, +/- π/6)
-          angle = (deviationHz / 15.0).clamp(-1, 1) * pi / 6;
-        });
-
-        audioBuffer = audioBuffer.sublist(bufferSize);
-      }
-    });
   }
   List<double> getFrequenciesForTuning(String tuningName) {
     switch (tuningName) {
@@ -222,11 +199,9 @@ class _TunerScreenState extends State<TunerScreen>
     }
     return minIdx;
   }
-  void stopMicStream() {
-    _micSubscription?.cancel();
-    _micSubscription = null;
-    _micStream = null;
-  }
+  final RecorderStream recorder = RecorderStream();
+  StreamSubscription<List<int>>? _audioStreamSub;
+
 
   Future<void> requestMicrophonePermission() async {
     var status = await Permission.microphone.request();
@@ -247,21 +222,20 @@ class _TunerScreenState extends State<TunerScreen>
       openAppSettings();
     }
   }
-  void startTuning() {
-    setState(() {
-      isTuning = true;
-    });
-    _controller.repeat(reverse: true);
-    startMicStream();
+
+  void startTuning() async {
+    setState(() { isTuning = true; });
+    await recorder.start();
+    _audioStreamSub = recorder.audioStream.listen(processAudioData);
   }
 
-  void stopTuning() {
-    setState(() {
-      isTuning = false;
-    });
-    _controller.stop();
-    stopMicStream();
+  void stopTuning() async {
+    setState(() { isTuning = false; });
+    await recorder.stop();
+    await _audioStreamSub?.cancel();
+    _audioStreamSub = null;
   }
+
 
   void changeString(int idx) {
     setState(() {
@@ -269,11 +243,11 @@ class _TunerScreenState extends State<TunerScreen>
     });
   }
 
+
   @override
   void dispose() {
-    _controller.dispose();
-    _scrollController.dispose();
-    stopMicStream(); // ← вот тут!
+    _audioStreamSub?.cancel();
+    recorder.stop();
     super.dispose();
   }
 
