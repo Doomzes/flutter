@@ -213,11 +213,11 @@ class _TunerScreenState extends State<TunerScreen>
       });
     } else {
       await _audioCapture.start(
+        onFrame: processAudioFrame,
+        onError: (Object e) => debugPrint('Error: $e'),
         sampleRate: 44100,
         bufferSize: bufferSize,
         audioFormat: AudioFormat.ENCODING_PCM_16BIT,
-        onFrame: processAudioFrame,
-        onError: (Object e) => debugPrint('Error: $e'),
       );
     }
   }
