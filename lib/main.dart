@@ -1,9 +1,10 @@
 import 'package:flutter/material.dart';
 import 'dart:math';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:sound_stream/sound_stream.dart';
+import 'package:flutter_audio_capture/flutter_audio_capture.dart';
 import 'dart:typed_data';
 import 'dart:async';
+import 'dart:io';
 
 void main() {
   runApp(const GuitarTunerApp());
@@ -67,6 +68,7 @@ class _TunerScreenState extends State<TunerScreen>
   Tuning? selectedTuning;
   bool isTuning = false;
   double angle = 0.0;
+  final FlutterAudioCapture _audioCapture = FlutterAudioCapture();
 
   int currentString = 0; // 1-я струна = индекс 0 (слева и внизу)
   List<bool> tuned = List.generate(6, (_) => false);
@@ -76,36 +78,9 @@ class _TunerScreenState extends State<TunerScreen>
   void initState() {
     super.initState();
     requestMicrophonePermission();
-    recorder.initialize();
     selectedTuning = tunings.first; // <-- Дефолтный строй, если вдруг не выбран
   }
 
-  void processAudioData(List<int> data) {
-    // преобразуем в Int16 и далее - в double
-    final doubles = Int16List.view(Uint8List.fromList(data).buffer)
-      .map((x) => x / 32768.0)
-      .toList();
-
-    audioBuffer.addAll(doubles);
-
-    while (audioBuffer.length > bufferSize) {
-      final segment = audioBuffer.sublist(0, bufferSize);
-      final freq = detectFrequency(segment, 44100);
-      List<double> targetFreqs = getFrequenciesForTuning(selectedTuning!.name);
-      int closest = findClosestString(freq, targetFreqs);
-      double deviationHz = freq - targetFreqs[closest];
-
-      setState(() {
-        detectedFrequency = freq;
-        currentString = closest;
-        deviation = deviationHz;
-        tuned = List.generate(6, (i) => (i == closest) && deviationHz.abs() < 1.0);
-        angle = (deviationHz / 15.0).clamp(-1, 1) * pi / 6;
-      });
-
-      audioBuffer = audioBuffer.sublist(bufferSize);
-    }
-  }
   List<double> getFrequenciesForTuning(String tuningName) {
     switch (tuningName) {
       case 'E':
@@ -199,8 +174,6 @@ class _TunerScreenState extends State<TunerScreen>
     }
     return minIdx;
   }
-  final RecorderStream recorder = RecorderStream();
-  StreamSubscription<List<int>>? _audioStreamSub;
 
 
   Future<void> requestMicrophonePermission() async {
@@ -225,18 +198,59 @@ class _TunerScreenState extends State<TunerScreen>
 
   void startTuning() async {
     setState(() { isTuning = true; });
-    await recorder.start();
-    _audioStreamSub = recorder.audioStream.listen(processAudioData);
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+      // Просто для теста UI — имитируем колебания частоты
+      Future.doWhile(() async {
+        if (!isTuning) return false;
+        setState(() {
+          detectedFrequency = 82.41 + Random().nextDouble() * 2 - 1; // +/- 1 Hz
+          deviation = detectedFrequency - 82.41;
+          tuned = List.generate(6, (i) => (i == currentString) && deviation.abs() < 1.0);
+          angle = (deviation / 15.0).clamp(-1, 1) * pi / 6;
+        });
+        await Future.delayed(Duration(milliseconds: 500));
+        return true;
+      });
+    } else {
+      await _audioCapture.start(
+        sampleRate: 44100,
+        bufferSize: bufferSize,
+        audioFormat: AudioFormat.ENCODING_PCM_16BIT,
+        onFrame: processAudioFrame,
+        onError: (Object e) => debugPrint('Error: $e'),
+      );
+    }
   }
 
   void stopTuning() async {
     setState(() { isTuning = false; });
-    await recorder.stop();
-    await _audioStreamSub?.cancel();
-    _audioStreamSub = null;
+    if (Platform.isAndroid || Platform.isIOS) {
+      await _audioCapture.stop();
+    }
   }
 
+  void processAudioFrame(dynamic data) {
+    final floats = data as Float32List;
+    audioBuffer.addAll(floats);
 
+    while (audioBuffer.length > bufferSize) {
+      final segment = audioBuffer.sublist(0, bufferSize);
+      final freq = detectFrequency(segment, 44100);
+      List<double> targetFreqs = getFrequenciesForTuning(selectedTuning!.name);
+      int closest = findClosestString(freq, targetFreqs);
+      double deviationHz = freq - targetFreqs[closest];
+
+      setState(() {
+        detectedFrequency = freq;
+        currentString = closest;
+        deviation = deviationHz;
+        tuned = List.generate(6, (i) => (i == closest) && deviationHz.abs() < 1.0);
+        angle = (deviationHz / 15.0).clamp(-1, 1) * pi / 6;
+      });
+
+      audioBuffer = audioBuffer.sublist(bufferSize);
+    }
+  }
   void changeString(int idx) {
     setState(() {
       currentString = idx;
@@ -244,10 +258,8 @@ class _TunerScreenState extends State<TunerScreen>
   }
 
 
-  @override
   void dispose() {
-    _audioStreamSub?.cancel();
-    recorder.stop();
+    _audioCapture.stop(); // На всякий случай — чтобы точно освободить ресурсы
     super.dispose();
   }
 
